@@ -1,0 +1,122 @@
+# This workflow builds the godezk_device_vision_backend Docker image,
+# pushes it to Docker Hub, and updates the DevOps repo for Kubernetes deployment.
+# Required secrets: DOCKER_USERNAME, DOCKER_PASSWORD, DEVOPS_PAT
+name: Build and Deploy Vision_Backend Service
+
+# Trigger the workflow on push to specific branches or manual dispatch
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - stage
+    # Trigger on relevant paths to avoid unnecessary builds
+    paths:
+      - 'Dockerfile'
+      - 'package*.json'
+      - 'server.js'
+      - 'public/**'
+      - '.github/workflows/build-vision_backend.yml'
+  workflow_dispatch: # Allow manual trigger from GitHub UI
+
+# Global environment variables
+env:
+  IMAGE_NAME: kishore2712/godezk_device_vision_backend # Docker Hub image name
+
+jobs:
+  # Single job to build and push Docker image
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the repository code
+      # Fetches all history and tags to enable proper versioning
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Determine deployment environment based on branch name
+      # Maps 'main' branch to 'production' environment, others use branch name directly
+      - name: Set environment
+        id: env
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 3: Generate short SHA for image tagging
+      # Creates a 7-character commit SHA for readable image tags
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      # Step 4: Authenticate with Docker Hub
+      # Uses GitHub secrets for secure credential management
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Step 5: Set up Docker Buildx for advanced build features
+      # Enables multi-platform builds and cache management
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Step 6: Build and push Docker image with multiple tags and caching
+      # Tags: latest, full SHA, and environment-specific short SHA
+      # Uses registry cache for faster subsequent builds
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:${{ steps.env.outputs.environment }}-${{ steps.sha.outputs.short }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      # Step 7: Display deployment summary in GitHub Actions UI
+      # Renders markdown summary with deployment details for visibility
+      - name: Deployment summary
+        run: |
+          echo "### Deployment Summary :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ steps.env.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tagged Image:** ${{ env.IMAGE_NAME }}:${{ steps.env.outputs.environment }}-${{ steps.sha.outputs.short }}" >> $GITHUB_STEP_SUMMARY
+
+      # Step 8: Update DevOps repository with new image tag for Kubernetes deployment
+      # Clones DevOps repo, updates kustomization.yaml with new image tag, and pushes changes
+      # Skips for PR environments to avoid unwanted updates
+      - name: Update DevOps repo with new image tag
+        if: steps.env.outputs.environment != 'pr'
+        env:
+          DEVOPS_PAT: ${{ secrets.DEVOPS_PAT }}
+        run: |
+          git config --global user.email "ci@godezk-device-vision_backend.com"
+          git config --global user.name "GoDezk Device Vision_Backend CI"
+
+          git clone https://kishorek421:${DEVOPS_PAT}@github.com/kishorek421/godezk_device_devops.git devops
+          cd devops
+
+          BRANCH_NAME="${{ steps.env.outputs.environment }}"
+          if [ "$BRANCH_NAME" = "production" ]; then
+            BRANCH_NAME="main"
+          fi
+          git checkout $BRANCH_NAME || git checkout -b $BRANCH_NAME
+
+          cd k8s/services/vision_backend/overlays/$BRANCH_NAME
+
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          # Update the newTag field in kustomization.yaml with the new image tag
+          sed -i "s|newTag:.*|newTag: ${{ steps.env.outputs.environment }}-${SHORT_SHA}|g" kustomization.yaml
+
+          git add kustomization.yaml
+          git diff --staged --quiet || git commit -m "ci: update device-vision_backend ${{ steps.env.outputs.environment }} image to ${SHORT_SHA}"
+          git pull --rebase origin $BRANCH_NAME
+          git push origin $BRANCH_NAME
