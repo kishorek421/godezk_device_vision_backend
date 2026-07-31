@@ -1,0 +1,13 @@
+{
+  "name": "godezk-device-vision-backend",
+  "version": "1.0.0",
+  "description": "GoDezk Device Vision Backend service",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "private": true
+}

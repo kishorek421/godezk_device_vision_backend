@@ -4,9 +4,10 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Install app dependencies
-# A wildcard is used to ensure both package.json AND package-lock.json are copied
+# package*.json is copied; npm install works without a committed package-lock.json
+# Once a package-lock.json is added, switch this back to npm ci for faster builds
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm install --omit=dev
 
 # Bundle app source
 COPY . .
