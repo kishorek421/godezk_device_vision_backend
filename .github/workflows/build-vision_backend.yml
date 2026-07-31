@@ -1,6 +1,14 @@
+# =============================================================================
+# GitHub Actions Workflow: Build, Push, and Deploy Vision Backend
+# =============================================================================
 # This workflow builds the godezk_device_vision_backend Docker image,
 # pushes it to Docker Hub, and updates the DevOps repo for Kubernetes deployment.
-# Required secrets: DOCKER_USERNAME, DOCKER_PASSWORD, DEVOPS_PAT
+#
+# Required GitHub repository secrets:
+#   - DOCKER_USERNAME: Docker Hub username for image push
+#   - DOCKER_PASSWORD: Docker Hub password or access token
+#   - DEVOPS_PAT:      PAT with repo write access for the DevOps repo
+# =============================================================================
 name: Build and Deploy Vision_Backend Service
 
 # Trigger the workflow on push to specific branches or manual dispatch
@@ -19,7 +27,8 @@ on:
       - '.github/workflows/build-vision_backend.yml'
   workflow_dispatch: # Allow manual trigger from GitHub UI
 
-# Global environment variables
+# Global environment variables available to all workflow steps
+# IMAGE_NAME defines the Docker Hub repository for the built image
 env:
   IMAGE_NAME: kishore2712/godezk_device_vision_backend # Docker Hub image name
 
@@ -91,8 +100,11 @@ jobs:
           echo "**Tagged Image:** ${{ env.IMAGE_NAME }}:${{ steps.env.outputs.environment }}-${{ steps.sha.outputs.short }}" >> $GITHUB_STEP_SUMMARY
 
       # Step 8: Update DevOps repository with new image tag for Kubernetes deployment
-      # Clones DevOps repo, updates kustomization.yaml with new image tag, and pushes changes
-      # Skips for PR environments to avoid unwanted updates
+      # - Clones the shared DevOps repo holding Kubernetes manifests
+      # - Checks out the environment-specific overlay branch
+      # - Rewrites the kustomization.yaml image tag to the new build tag
+      # - Commits, rebases, and pushes the change back
+      # - Skips for PR environments to avoid unwanted overlay updates
       - name: Update DevOps repo with new image tag
         if: steps.env.outputs.environment != 'pr'
         env:
