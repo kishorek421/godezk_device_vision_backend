@@ -73,7 +73,29 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Step 6: Build and push Docker image with multiple tags and caching
+      # Step 6: Bundle frontend dist into backend build context
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Checkout frontend
+        uses: actions/checkout@v4
+        with:
+          repository: kishorek421/godezk_device_vision_frontend
+          ref: dev
+          path: frontend
+          token: ${{ secrets.DEVOPS_PAT }}
+
+      - name: Build frontend into backend dist
+        run: |
+          cd frontend
+          npm install
+          npm run build
+          mkdir -p ../dist
+          cp -r dist/* ../dist/
+
+      # Step 7: Build and push Docker image with multiple tags and caching
       # Tags: latest, full SHA, and environment-specific short SHA
       # Uses registry cache for faster subsequent builds
       - name: Build and push Docker image

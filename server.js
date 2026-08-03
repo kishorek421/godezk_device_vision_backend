@@ -4,9 +4,10 @@ const cors = require('cors');
 const axios = require('axios');
 const { createClient } = require('redis');
 const path = require('path');
+const fs = require('fs');
 
 const PORT = process.env.PORT || 3010;
-const BACKDOOR_BASE_URL = (process.env.BACKDOOR_BASE_URL || 'http://localhost:8090').replace(/\/$/, '');
+const BACKDOOR_BASE_URL = (process.env.BACKDOOR_BASE_URL || 'https://dev.device-medops.godezk.com').replace(/\/$/, '');
 const BACKDOOR_TOKEN = process.env.BACKDOOR_TOKEN || null;
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const ORG_ID = process.env.ORG_ID || 'default';
@@ -441,10 +442,19 @@ app.post('/api/ingest/pipeline', (req, res) => {
   res.json({ success: true, stored: stored.length });
 });
 
-app.use(express.static(path.join(__dirname, '../godezk_device_vision_frontend/dist')));
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
+let staticDir = path.join(__dirname, 'dist');
+if (!fs.existsSync(path.join(staticDir, 'index.html'))) {
+  staticDir = path.join(__dirname, '../godezk_device_vision_frontend/dist');
+}
+if (fs.existsSync(staticDir)) {
+  app.use(express.static(staticDir));
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api/')) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    res.sendFile(path.join(staticDir, 'index.html'));
+  });
+}
 
 async function startRedis() {
   if (REDIS_URL === 'none' || !REDIS_URL) return;
