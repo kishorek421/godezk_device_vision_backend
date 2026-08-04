@@ -3,43 +3,23 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { createClient } = require('redis');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 3010;
-const BACKDOOR_BASE_URL = (process.env.BACKDOOR_BASE_URL || 'https://dev.device-medops.godezk.com').replace(/\/$/, '');
+const BACKDOOR_BASE_URL = (process.env.BACKDOOR_BASE_URL || '').replace(/\/$/, '');
 const BACKDOOR_TOKEN = process.env.BACKDOOR_TOKEN || null;
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const ORG_ID = process.env.ORG_ID || 'default';
-const ENABLE_MOCK = process.env.ENABLE_MOCK !== 'false';
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const MAX_EVENTS = parseInt(process.env.MAX_EVENTS || '100000', 10);
-const MOCK_EXECUTION_COUNT = parseInt(process.env.MOCK_EXECUTION_COUNT || '25', 10);
+const MOCK_EXECUTION_COUNT = 25;
 
-const CATALOGS = ['person_detection', 'ppe_violation', 'fire_detection', 'plate_detected', 'violence_detected'];
-const STATUSES = ['completed', 'completed', 'completed', 'failed', 'running'];
-
-const COMPONENT_NAMES = [
-  'rtsp_camera',
-  'rtsp_handler',
-  'function_adapter',
-  'device_connection_manager',
-  'frame_weir',
-  'frame_bus',
-  'queuer',
-  'pre_screener',
-  'perception_gate',
-  'inference_service',
-  'semantic_event',
-  'redis_cooldown',
-  'postgresql_workflow_runner_queue',
-  'queue_handler',
-  'redis_executor_task_channel',
-  'executor_worker_pool',
-  'postgresql_task_hydration',
-  'runner_execute_graph',
-  'graph_nodes',
-  'postgresql_execution_record',
-  'redis_telemetry_events',
+const COMPONENTS = [
+  'rtsp_camera', 'rtsp_handler', 'function_adapter', 'device_connection_manager', 'frame_weir',
+  'frame_bus', 'queuer', 'pre_screener', 'perception_gate', 'inference_service', 'semantic_event',
+  'redis_cooldown', 'postgresql_workflow_runner_queue', 'queue_handler', 'redis_executor_task_channel',
+  'executor_worker_pool', 'postgresql_task_hydration', 'runner_execute_graph', 'graph_nodes',
+  'postgresql_execution_record', 'redis_telemetry_events'
 ];
 
 const STAGE_TO_COMPONENT = {
@@ -50,32 +30,38 @@ const STAGE_TO_COMPONENT = {
   workflow_queued: 'postgresql_workflow_runner_queue',
   workflow_started: 'runner_execute_graph',
   workflow_done: 'runner_execute_graph',
+  execution_record: 'postgresql_execution_record'
 };
+
+const CATALOGS = ['person_detection', 'ppe_violation', 'fire_detection', 'plate_detected', 'violence_detected'];
+const STATUSES = ['completed', 'completed', 'completed', 'failed', 'running'];
 
 const eventStore = [];
 let mockExecutions = [];
 
-function nowMs() {
-  return Date.now();
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+function nowMs() { return Date.now(); }
+
+function clampEvents() {
+  if (eventStore.length > MAX_EVENTS) eventStore.splice(0, eventStore.length - MAX_EVENTS);
 }
 
 function parseTime(value) {
   if (value == null) return null;
   const str = String(value).trim();
-  const ms = Number(str);
-  if (!Number.isNaN(ms)) return ms;
-  const match = str.match(/^(\d+(?:\.\d+)?)\s*([smhd])$/i);
-  if (!match) return new Date(str).getTime() || null;
-  const n = parseFloat(match[1]);
-  const unit = match[2].toLowerCase();
-  const multipliers = { s: 1000, m: 60 * 1000, h: 60 * 60 * 1000, d: 24 * 60 * 60 * 1000 };
-  return Math.round(n * multipliers[unit]);
-}
-
-function clampEvents() {
-  if (eventStore.length > MAX_EVENTS) {
-    eventStore.splice(0, eventStore.length - MAX_EVENTS);
+  const n = Number(str);
+  if (!Number.isNaN(n)) return n;
+  const m = str.match(/^(\d+(?:\.\d+)?)\s*([smhd])$/i);
+  if (m) {
+    const v = parseFloat(m[1]);
+    const unit = m[2].toLowerCase();
+    const mult = { s: 1000, m: 60 * 1000, h: 60 * 60 * 1000, d: 24 * 60 * 60 * 1000 };
+    return Math.round(v * mult[unit]);
   }
+  return new Date(str).getTime() || null;
 }
 
 function normalizeExecution(row) {
@@ -88,49 +74,70 @@ function normalizeExecution(row) {
   return row;
 }
 
-function buildComponentBreakdown(execution) {
+function addBreakdownValue(breakdown, component, ms) {
+  if (ms == null) return;
+  breakdown[component] = (breakdown[component] || 0) + Number(ms);
+}
+
+function buildComponentBreakdown(ex) {
   const breakdown = {};
-  const ctx = execution.context || {};
+  const ctx = ex.context || {};
   const runtime = ctx.runtime || {};
   const event = ctx.event || {};
 
-  if (runtime.ai_time_ms != null) breakdown.inference_service = (breakdown.inference_service || 0) + runtime.ai_time_ms;
-  if (runtime.queue_wait_ms != null) breakdown.queuer = (breakdown.queuer || 0) + runtime.queue_wait_ms;
-  if (runtime.db_time_ms != null) breakdown.postgresql_task_hydration = (breakdown.postgresql_task_hydration || 0) + runtime.db_time_ms;
+  addBreakdownValue(breakdown, 'inference_service', runtime.ai_time_ms);
+  addBreakdownValue(breakdown, 'queuer', runtime.queue_wait_ms);
+  addBreakdownValue(breakdown, 'postgresql_task_hydration', runtime.db_time_ms);
+  addBreakdownValue(breakdown, 'frame_bus', runtime.bus_time_ms);
+
+  if (runtime.bus && typeof runtime.bus === 'object') {
+    for (const k of Object.keys(runtime.bus)) addBreakdownValue(breakdown, 'frame_bus', runtime.bus[k]);
+  }
 
   const nodes = ctx.node_results || {};
   let nodeTotal = 0;
   for (const key of Object.keys(nodes)) {
     nodeTotal += Number(nodes[key]?.duration_ms || 0);
   }
-  if (nodeTotal) breakdown.graph_nodes = (breakdown.graph_nodes || 0) + nodeTotal;
+  addBreakdownValue(breakdown, 'graph_nodes', nodeTotal);
 
-  const started = execution.started_at_ms || new Date(execution.started_at).getTime() || 0;
-  const ended = execution.completed_at_ms || new Date(execution.completed_at).getTime() || started + (execution.duration_ms || 0);
-  const deviceId = event.device_id || event.camera_id || execution.device_id;
+  const started = ex.started_at_ms || 0;
+  const ended = ex.completed_at_ms || (started + (ex.duration_ms || 0));
+  const deviceId = event.device_id || ex.device_id;
 
-  const matching = eventStore.filter(ev => {
-    if (ev == null || ev.ts == null) return false;
-    if (ev.ts < started || ev.ts > ended) return false;
-    if (deviceId && ev.device_id && ev.device_id !== deviceId) return false;
-    return true;
-  });
+  const matching = eventStore.filter(ev =>
+    ev && ev.ts != null && ev.ts >= started && ev.ts <= ended &&
+    (!deviceId || !ev.device_id || ev.device_id === deviceId)
+  );
 
   for (const ev of matching) {
-    const comp = STAGE_TO_COMPONENT[ev.stage] || ev.component || ev.stage;
-    if (comp && ev.duration_ms != null) {
-      breakdown[comp] = (breakdown[comp] || 0) + Number(ev.duration_ms);
+    const comp = STAGE_TO_COMPONENT[ev.stage] || ev.component;
+    addBreakdownValue(breakdown, comp, ev.duration_ms);
+  }
+
+  const stageTimings = runtime.stage_timings || {};
+  for (const [stage, ms] of Object.entries(stageTimings)) {
+    const comp = STAGE_TO_COMPONENT[stage];
+    if (comp) addBreakdownValue(breakdown, comp, ms);
+    else addBreakdownValue(breakdown, stage, ms);
+  }
+
+  if (started && ended && ended >= started) {
+    const total = ended - started;
+    const known = Object.values(breakdown).reduce((s, v) => s + v, 0);
+    const residual = Math.max(0, total - known);
+    if (residual > 0) {
+      addBreakdownValue(breakdown, 'rtsp_camera', Math.floor(residual / 2));
+      addBreakdownValue(breakdown, 'rtsp_handler', residual - Math.floor(residual / 2));
     }
   }
 
   return breakdown;
 }
 
-function humanize(ms) {
-  if (ms == null || Number.isNaN(ms)) return '-';
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  if (ms < 60 * 1000) return `${(ms / 1000).toFixed(2)}s`;
-  return `${(ms / (60 * 1000)).toFixed(2)}m`;
+function enrich(execution) {
+  execution.component_breakdown = buildComponentBreakdown(execution);
+  return execution;
 }
 
 function seedMockData() {
@@ -143,15 +150,13 @@ function seedMockData() {
     const totalMs = Math.floor(Math.random() * 2500) + 350;
     const completedAt = status === 'running' ? null : startedAt + totalMs;
     const deviceId = `dev-mock-${String(i).padStart(4, '0')}`;
-    const execId = `mock-exec-${i}`;
-    const seqNo = i + 1;
     const aiMs = Math.floor(Math.random() * 600) + 50;
     const queueMs = Math.floor(Math.random() * 200) + 20;
     const dbMs = Math.floor(Math.random() * 150) + 10;
     const nodeMs = Math.max(0, totalMs - aiMs - queueMs - dbMs - 100);
 
-    const execution = {
-      id: execId,
+    const ex = {
+      id: `mock-exec-${i}`,
       org_id: ORG_ID,
       catalog_id: `catalog-${catalog}`,
       catalog_name: catalog.replace(/_/g, ' ').toUpperCase(),
@@ -163,38 +168,35 @@ function seedMockData() {
       started_at_ms: startedAt,
       completed_at_ms: completedAt,
       duration_ms: completedAt ? totalMs : null,
-      seq_no: seqNo,
+      seq_no: i + 1,
+      device_id: deviceId,
       context: {
         event: { device_id: deviceId, frame_id: `frame-${i}`, timestamp: startedAt },
         runtime: { ai_time_ms: aiMs, queue_wait_ms: queueMs, db_time_ms: dbMs },
         node_results: {
           storage: { duration_ms: Math.floor(nodeMs * 0.3) },
-          notification: { duration_ms: Math.floor(nodeMs * 0.2) },
-          database: { duration_ms: Math.floor(nodeMs * 0.3) },
-          action: { duration_ms: Math.max(0, nodeMs - Math.floor(nodeMs * 0.8)) },
-        },
-      },
-      human_id: `${catalog.substring(0, 2).toUpperCase()}-${String(seqNo).padStart(6, '0')}-${execId.slice(-7)}`,
-      error_message: status === 'failed' ? 'Simulated failure' : null,
+          action: { duration_ms: Math.floor(nodeMs * 0.2) },
+          notification: { duration_ms: Math.floor(nodeMs * 0.25) },
+          database: { duration_ms: Math.floor(nodeMs * 0.25) }
+        }
+      }
     };
+    mockExecutions.push(ex);
 
-    mockExecutions.push(execution);
-
-    const components = [
+    const events = [
       { stage: 'frame_received', component: 'queuer', duration_ms: queueMs, ts: startedAt + 10 },
       { stage: 'inference_done', component: 'inference_service', duration_ms: aiMs, ts: startedAt + 50 + queueMs },
       { stage: 'gate_decision', component: 'perception_gate', duration_ms: Math.floor(Math.random() * 30) + 5, ts: startedAt + 60 + queueMs + aiMs },
       { stage: 'workflow_queued', component: 'postgresql_workflow_runner_queue', duration_ms: dbMs, ts: startedAt + 80 + queueMs + aiMs },
       { stage: 'workflow_started', component: 'runner_execute_graph', duration_ms: Math.floor(nodeMs * 0.5), ts: startedAt + 100 + queueMs + aiMs + dbMs },
-      { stage: 'workflow_done', component: 'postgresql_execution_record', duration_ms: completedAt ? completedAt - startedAt : totalMs, ts: completedAt || startedAt + totalMs },
+      { stage: 'workflow_done', component: 'postgresql_execution_record', duration_ms: completedAt ? completedAt - startedAt : totalMs, ts: completedAt || startedAt + totalMs }
     ];
-
-    for (const ev of components) {
-      eventStore.push({ org_id: ORG_ID, device_id: deviceId, event_type: catalog, ...ev });
-    }
+    for (const ev of events) eventStore.push({ org_id: ORG_ID, device_id: deviceId, ...ev });
   }
   clampEvents();
 }
+
+seedMockData();
 
 function backdoorHeaders(orgId) {
   const headers = { 'x-org-id': orgId || ORG_ID };
@@ -202,290 +204,208 @@ function backdoorHeaders(orgId) {
   return headers;
 }
 
-async function fetchBackdoorExecutions(query) {
-  if (BACKDOOR_BASE_URL === 'none') return null;
-  const url = `${BACKDOOR_BASE_URL}/api/workflows/executions`;
+async function callBackdoor(method, path, params = {}, orgId) {
+  if (!BACKDOOR_BASE_URL) return null;
   try {
-    const { data } = await axios.get(url, { params: query, headers: backdoorHeaders(query.org_id), timeout: 3000 });
-    return data.success ? data : null;
-  } catch (err) {
-    return null;
-  }
+    const url = `${BACKDOOR_BASE_URL}${path}`;
+    const { data } = await axios({ method, url, params, headers: backdoorHeaders(orgId), timeout: 5000 });
+    return data;
+  } catch (_) { return null; }
 }
 
-async function fetchBackdoorExecution(id, orgId) {
-  if (BACKDOOR_BASE_URL === 'none') return null;
-  const url = `${BACKDOOR_BASE_URL}/api/workflows/executions/${encodeURIComponent(id)}`;
-  try {
-    const { data } = await axios.get(url, { params: { org_id: orgId || ORG_ID }, headers: backdoorHeaders(orgId), timeout: 3000 });
-    return data.success ? data : null;
-  } catch (err) {
-    return null;
+function matchesMock(q, ex) {
+  if (q.org_id && ex.org_id !== q.org_id) return false;
+  if (q.catalog_id && ex.catalog_id !== q.catalog_id) return false;
+  if (q.installation_id && ex.installation_id !== q.installation_id) return false;
+  if (q.status && ex.status !== q.status) return false;
+  if (q.trigger_event && ex.trigger_event !== q.trigger_event) return false;
+  if (q.q) {
+    const hay = `${ex.id} ${ex.catalog_name} ${ex.trigger_event} ${ex.status}`.toLowerCase();
+    if (!hay.includes(String(q.q).toLowerCase())) return false;
   }
+  const from = parseTime(q.date_from);
+  const to = parseTime(q.date_to);
+  if (from && ex.started_at_ms < from) return false;
+  if (to && ex.started_at_ms > to) return false;
+  return true;
 }
 
-function filterMockExecutions(query) {
-  let rows = [...mockExecutions];
-  if (query.q) {
-    const q = String(query.q).toLowerCase();
-    rows = rows.filter(r => (r.human_id || '').toLowerCase().includes(q) || (r.catalog_name || '').toLowerCase().includes(q));
-  }
-  if (query.status) {
-    const statuses = String(query.status).split(',').filter(Boolean);
-    rows = rows.filter(r => statuses.includes(r.status));
-  }
-  if (query.date_from) {
-    const from = new Date(query.date_from).getTime();
-    rows = rows.filter(r => r.started_at_ms >= from);
-  }
-  if (query.date_to) {
-    const to = new Date(query.date_to).getTime();
-    rows = rows.filter(r => (r.completed_at_ms || r.started_at_ms) <= to);
-  }
-  if (query.catalog_id) rows = rows.filter(r => r.catalog_id === query.catalog_id);
-  if (query.installation_id) rows = rows.filter(r => r.installation_id === query.installation_id);
-  if (query.device_id) rows = rows.filter(r => (r.context?.event?.device_id || r.device_id) === query.device_id);
+function sortMock(executions, sort) {
+  if (!sort) return executions;
+  const [field, dir] = String(sort).split(':');
+  const d = dir === 'asc' ? 1 : -1;
+  return [...executions].sort((a, b) => {
+    const av = a[field] ?? 0;
+    const bv = b[field] ?? 0;
+    return (av < bv ? -1 : av > bv ? 1 : 0) * d;
+  });
+}
 
-  const sort = String(query.sort || 'started_at_desc').toLowerCase();
-  rows.sort((a, b) => sort === 'started_at_asc' ? a.started_at_ms - b.started_at_ms : b.started_at_ms - a.started_at_ms);
+async function fetchExecutions(query = {}) {
+  const backdoorParams = {
+    org_id: query.org_id || ORG_ID,
+    date_from: query.date_from,
+    date_to: query.date_to,
+    page: query.page || 1,
+    page_size: query.page_size || 25,
+    status: query.status,
+    catalog_id: query.catalog_id,
+    installation_id: query.installation_id,
+    q: query.q
+  };
+  const data = await callBackdoor('get', '/api/workflows/executions', backdoorParams, query.org_id);
+  if (data && data.success && Array.isArray(data.executions)) {
+    return {
+      success: true,
+      executions: data.executions.map(normalizeExecution).map(enrich),
+      total_count: data.total_count || data.executions.length,
+      page: parseInt(data.page || backdoorParams.page, 10),
+      page_size: parseInt(data.page_size || backdoorParams.page_size, 10)
+    };
+  }
 
-  const page = Math.max(parseInt(query.page, 10) || 1, 1);
-  const pageSize = Math.min(Math.max(parseInt(query.page_size, 10) || 25, 1), 500);
-  const offset = (page - 1) * pageSize;
-  const paginated = rows.slice(offset, offset + pageSize);
-
+  let filtered = mockExecutions.filter(e => matchesMock(query, e));
+  if (query.sort) filtered = sortMock(filtered, query.sort);
+  const page = Math.max(1, parseInt(query.page || 1, 10));
+  const pageSize = Math.max(1, parseInt(query.page_size || 25, 10));
+  const start = (page - 1) * pageSize;
+  const pageItems = filtered.slice(start, start + pageSize);
   return {
     success: true,
-    executions: paginated.map(r => ({ ...r, component_breakdown: buildComponentBreakdown(r) })),
-    total_count: rows.length,
+    executions: pageItems.map(enrich),
+    total_count: filtered.length,
     page,
-    page_size: pageSize,
+    page_size: pageSize
   };
 }
 
-function aggregateComponentTotals(fromMs, toMs) {
-  const filtered = eventStore.filter(e => e.ts >= fromMs && e.ts <= toMs);
-  const byComp = {};
-  for (const ev of filtered) {
-    const comp = STAGE_TO_COMPONENT[ev.stage] || ev.component || ev.stage;
-    if (!comp || ev.duration_ms == null) continue;
-    const dur = Number(ev.duration_ms);
-    if (!byComp[comp]) byComp[comp] = { total_ms: 0, count: 0, min_ms: dur, max_ms: dur };
-    byComp[comp].total_ms += dur;
-    byComp[comp].count += 1;
-    byComp[comp].min_ms = Math.min(byComp[comp].min_ms, dur);
-    byComp[comp].max_ms = Math.max(byComp[comp].max_ms, dur);
+async function fetchExecution(id, orgId) {
+  const data = await callBackdoor('get', `/api/workflows/executions/${id}`, {}, orgId);
+  if (data && data.success && data.execution) return { success: true, execution: enrich(normalizeExecution(data.execution)) };
+  if (data && data.execution) return { success: true, execution: enrich(normalizeExecution(data.execution)) };
+  const found = mockExecutions.find(e => e.id === id);
+  if (found) return { success: true, execution: enrich(normalizeExecution({ ...found })) };
+  return { success: false, message: 'execution not found' };
+}
+
+function ingestEvents(events) {
+  if (!Array.isArray(events)) return 0;
+  for (const ev of events) {
+    if (ev && ev.ts != null) eventStore.push(ev);
   }
-  const totals = Object.entries(byComp)
-    .map(([component, v]) => ({
-      component,
-      total_ms: Math.round(v.total_ms),
-      avg_ms: v.count ? Math.round(v.total_ms / v.count) : 0,
-      min_ms: Math.round(v.min_ms),
-      max_ms: Math.round(v.max_ms),
-      count: v.count,
-    }))
-    .sort((a, b) => b.total_ms - a.total_ms);
-  return totals;
+  clampEvents();
+  return events.length;
 }
 
-function summarizeExecutions(rows) {
-  const completed = rows.filter(r => r.status === 'completed');
-  const failed = rows.filter(r => r.status === 'failed');
-  const running = rows.filter(r => r.status === 'running');
-  const durations = rows.map(r => r.duration_ms).filter(v => v != null);
-  const totalDuration = durations.reduce((s, v) => s + v, 0);
-  return {
-    total: rows.length,
-    completed: completed.length,
-    failed: failed.length,
-    running: running.length,
-    total_duration_ms: Math.round(totalDuration),
-    avg_duration_ms: durations.length ? Math.round(totalDuration / durations.length) : 0,
-  };
+if (REDIS_URL && !REDIS_URL.startsWith('redis://none')) {
+  const redis = createClient({ url: REDIS_URL });
+  redis.on('error', () => {});
+  redis.connect().then(() => {
+    redis.subscribe('godezk:pipeline:timing', (message) => {
+      try {
+        const parsed = JSON.parse(message);
+        if (Array.isArray(parsed)) ingestEvents(parsed);
+        else if (parsed) ingestEvents([parsed]);
+      } catch (_) {}
+    });
+    redis.subscribe('godezk:execution:new', (message) => {
+      try {
+        const parsed = JSON.parse(message);
+        if (Array.isArray(parsed)) ingestEvents(parsed);
+        else if (parsed) ingestEvents([parsed]);
+      } catch (_) {}
+    });
+  }).catch(() => {});
 }
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.get('/health', (_req, res) => res.json({
+  ok: true,
+  events_in_memory: eventStore.length,
+  mock_executions: mockExecutions.length,
+  backdoor: BACKDOOR_BASE_URL ? 'configured' : 'disabled'
+}));
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'telemetry-dashboard', events: eventStore.length, executions: mockExecutions.length });
-});
-
-app.get('/api/components', (req, res) => {
-  res.json({ components: COMPONENT_NAMES });
-});
+app.get('/api/components', (_req, res) => res.json({ success: true, components: COMPONENTS }));
 
 app.get('/api/executions', async (req, res) => {
-  const query = { ...req.query };
-  query.org_id = query.org_id || ORG_ID;
-
-  const backdoorData = await fetchBackdoorExecutions(query);
-  if (backdoorData) {
-    const rows = (backdoorData.executions || []).map(normalizeExecution).map(r => ({
-      ...r,
-      component_breakdown: buildComponentBreakdown(r),
-      component_total_ms: Object.values(buildComponentBreakdown(r)).reduce((s, v) => s + v, 0),
-    }));
-    return res.json({
-      ...backdoorData,
-      executions: rows,
-    });
-  }
-
-  if (ENABLE_MOCK) {
-    return res.json(filterMockExecutions(query));
-  }
-
-  res.status(503).json({ success: false, error: 'Backdoor unavailable and mock data disabled' });
+  const result = await fetchExecutions(req.query);
+  res.status(result.success ? 200 : 503).json(result);
 });
 
 app.get('/api/executions/:id', async (req, res) => {
-  const { id } = req.params;
-  const orgId = req.query.org_id || ORG_ID;
-  const backdoor = await fetchBackdoorExecution(id, orgId);
-  if (backdoor && backdoor.execution) {
-    const row = normalizeExecution(backdoor.execution);
-    row.component_breakdown = buildComponentBreakdown(row);
-    return res.json({ ...backdoor, execution: row });
-  }
+  const result = await fetchExecution(req.params.id, req.query.org_id);
+  res.status(result.success ? 200 : 404).json(result);
+});
 
-  if (ENABLE_MOCK) {
-    const row = mockExecutions.find(e => e.id === id || e.human_id === id);
-    if (row) {
-      const r = normalizeExecution({ ...row });
-      r.component_breakdown = buildComponentBreakdown(r);
-      return res.json({ success: true, execution: r, runtime_context: r.context });
-    }
-  }
-
-  res.status(404).json({ success: false, error: 'Execution not found' });
+app.post('/api/ingest/pipeline', (req, res) => {
+  const count = ingestEvents(req.body);
+  res.json({ success: true, ingested: count, total_in_memory: eventStore.length });
 });
 
 app.get('/api/analytics', async (req, res) => {
-  let toMs = req.query.to ? parseTime(req.query.to) : nowMs();
-  let fromMs = req.query.from ? parseTime(req.query.from) : null;
-  const windowMs = parseTime(req.query.time_window);
-  if (windowMs != null) {
-    toMs = toMs || nowMs();
-    fromMs = toMs - windowMs;
-  }
-  if (fromMs == null) fromMs = toMs - 60 * 60 * 1000;
+  let from = parseTime(req.query.from);
+  let to = parseTime(req.query.to);
+  const window = parseTime(req.query.time_window);
+  if (to == null) to = nowMs();
+  if (from == null && window != null) from = to - window;
+  if (from == null) from = to - 60 * 60 * 1000;
 
-  const orgId = req.query.org_id || ORG_ID;
-
-  const backdoorQuery = {
-    org_id: orgId,
-    date_from: new Date(fromMs).toISOString(),
-    date_to: new Date(toMs).toISOString(),
+  const result = await fetchExecutions({
+    org_id: req.query.org_id,
+    date_from: from,
+    date_to: to,
     page: 1,
-    page_size: 500,
-  };
+    page_size: 10000
+  });
 
-  let executions = [];
-  const backdoorData = await fetchBackdoorExecutions(backdoorQuery);
-  if (backdoorData) {
-    executions = (backdoorData.executions || []).map(normalizeExecution);
-  } else if (ENABLE_MOCK) {
-    executions = filterMockExecutions({ ...backdoorQuery, date_from: new Date(fromMs).toISOString(), date_to: new Date(toMs).toISOString() }).executions;
+  const executions = result.success ? result.executions : [];
+  const summary = {
+    total: executions.length,
+    completed: 0,
+    failed: 0,
+    running: 0,
+    avg_duration_ms: 0,
+    total_duration_ms: 0
+  };
+  const componentStats = {};
+
+  for (const ex of executions) {
+    summary[ex.status]++;
+    const dur = ex.duration_ms || (ex.completed_at_ms && ex.started_at_ms ? ex.completed_at_ms - ex.started_at_ms : 0);
+    if (dur > 0) summary.total_duration_ms += dur;
+    for (const [comp, ms] of Object.entries(ex.component_breakdown || {})) {
+      if (!componentStats[comp]) componentStats[comp] = { total_ms: 0, count: 0, min_ms: Infinity, max_ms: 0, avg_ms: 0 };
+      componentStats[comp].total_ms += ms;
+      componentStats[comp].count += 1;
+      componentStats[comp].min_ms = Math.min(componentStats[comp].min_ms, ms);
+      componentStats[comp].max_ms = Math.max(componentStats[comp].max_ms, ms);
+    }
   }
 
-  const execSummary = summarizeExecutions(executions);
-  const componentTotals = aggregateComponentTotals(fromMs, toMs);
-
-  const resolution = parseTime(req.query.resolution);
-  let timeline = [];
-  if (resolution != null && resolution > 0) {
-    const buckets = [];
-    for (let t = Math.floor(fromMs / resolution) * resolution; t < toMs; t += resolution) {
-      buckets.push({ start: t, end: Math.min(t + resolution, toMs), events: {} });
-    }
-    for (const ev of eventStore.filter(e => e.ts >= fromMs && e.ts <= toMs)) {
-      const bucket = buckets.find(b => ev.ts >= b.start && ev.ts < b.end) || buckets[buckets.length - 1];
-      if (!bucket) continue;
-      const comp = STAGE_TO_COMPONENT[ev.stage] || ev.component || ev.stage;
-      if (!comp || ev.duration_ms == null) continue;
-      bucket.events[comp] = (bucket.events[comp] || 0) + Number(ev.duration_ms);
-    }
-    timeline = buckets.map(b => ({
-      start: new Date(b.start).toISOString(),
-      end: new Date(b.end).toISOString(),
-      components: b.events,
-    }));
+  if (executions.length) summary.avg_duration_ms = Math.round(summary.total_duration_ms / executions.length);
+  for (const c of Object.keys(componentStats)) {
+    const s = componentStats[c];
+    s.avg_ms = s.count ? Math.round(s.total_ms / s.count) : 0;
+    if (!Number.isFinite(s.min_ms)) s.min_ms = 0;
   }
 
   res.json({
     success: true,
-    window: { from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString(), duration_ms: toMs - fromMs },
-    executions_summary: execSummary,
-    component_totals: componentTotals,
-    timeline,
+    from,
+    to,
+    summary,
+    component_stats: componentStats,
+    executions_count: executions.length
   });
 });
 
-app.post('/api/ingest/pipeline', (req, res) => {
-  const events = Array.isArray(req.body) ? req.body : [req.body];
-  const stored = [];
-  for (const ev of events) {
-    if (!ev || !ev.stage) continue;
-    const item = {
-      ...ev,
-      org_id: ev.org_id || ORG_ID,
-      ts: ev.ts || nowMs(),
-    };
-    eventStore.push(item);
-    stored.push(item);
-  }
-  clampEvents();
-  res.json({ success: true, stored: stored.length });
-});
-
-let staticDir = path.join(__dirname, 'dist');
-if (!fs.existsSync(path.join(staticDir, 'index.html'))) {
-  staticDir = path.join(__dirname, '../godezk_device_vision_frontend/dist');
-}
-if (fs.existsSync(staticDir)) {
-  app.use(express.static(staticDir));
-  app.get('*', (req, res) => {
-    if (req.path.startsWith('/api/')) {
-      return res.status(404).json({ error: 'Not found' });
-    }
-    res.sendFile(path.join(staticDir, 'index.html'));
+const distPath = path.join(__dirname, 'dist');
+if (fs.existsSync(distPath)) {
+  app.use(express.static(distPath));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) return next();
+    res.sendFile(path.join(distPath, 'index.html'));
   });
 }
 
-async function startRedis() {
-  if (REDIS_URL === 'none' || !REDIS_URL) return;
-  try {
-    const sub = createClient({ url: REDIS_URL });
-    sub.on('error', () => {});
-    await sub.connect();
-    await sub.subscribe('godezk:pipeline:timing', (message) => {
-      try {
-        const ev = JSON.parse(message);
-        if (ev && ev.ts) eventStore.push(ev);
-        clampEvents();
-      } catch (_) {}
-    });
-    await sub.subscribe('godezk:execution:new', (message) => {
-      try {
-        const ev = JSON.parse(message);
-        if (ev && ev.started_at) {
-          eventStore.push({ stage: 'execution_record', component: 'postgresql_execution_record', ...ev, ts: new Date(ev.started_at).getTime() });
-          clampEvents();
-        }
-      } catch (_) {}
-    });
-  } catch (err) {
-    console.error('Redis connect failed:', err.message);
-  }
-}
-
-if (ENABLE_MOCK) seedMockData();
-
-app.listen(PORT, async () => {
-  console.log(`Telemetry dashboard backend listening on http://localhost:${PORT}`);
-  await startRedis();
-});
+app.listen(PORT, () => console.log(`telemetry backend on :${PORT}`));
