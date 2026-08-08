@@ -13,6 +13,7 @@ const ORG_ID = process.env.ORG_ID || 'default';
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const MAX_EVENTS = parseInt(process.env.MAX_EVENTS || '100000', 10);
 const FRAMES_PER_DEPLOYMENT = parseInt(process.env.FRAMES_PER_DEPLOYMENT || '10', 10);
+const ENABLE_MOCK = process.env.ENABLE_MOCK === 'true';
 
 const COMPONENTS = [
   'rtsp_camera', 'rtsp_handler', 'function_adapter', 'device_connection_manager', 'frame_weir',
@@ -86,8 +87,35 @@ async function fetchRunningDeployments(orgId) {
       return s === 'active' || s === 'running' || (d.active_listeners || 0) > 0;
     });
   }
-  seedMockData();
-  return mockDeployments();
+  if (ENABLE_MOCK) {
+    seedMockData();
+    return mockDeployments();
+  }
+  return buildDeploymentsFromEvents();
+}
+
+function buildDeploymentsFromEvents() {
+  const byDep = new Map();
+  for (const ev of eventStore) {
+    if (!ev.deployment_id) continue;
+    const dep = byDep.get(ev.deployment_id) || {
+      id: ev.deployment_id,
+      org_id: ev.org_id || ORG_ID,
+      workflow_name: `Deployment ${String(ev.deployment_id).slice(-8)}`,
+      status: 'active',
+      active_listeners: 1,
+      device_ids: new Set(),
+      event_types: new Set()
+    };
+    if (ev.device_id) dep.device_ids.add(String(ev.device_id));
+    if (ev.event_type) dep.event_types.add(ev.event_type);
+    byDep.set(ev.deployment_id, dep);
+  }
+  return Array.from(byDep.values()).map(d => ({
+    ...d,
+    device_ids: Array.from(d.device_ids),
+    workflow_name: d.workflow_name + (d.event_types.size ? ` (${Array.from(d.event_types).join(', ')})` : '')
+  }));
 }
 
 // ── Frames: group pipeline timing events per device ────────────
@@ -241,7 +269,6 @@ app.get('/api/deployments', async (req, res) => {
   const orgId = req.query.org_id || ORG_ID;
   const limit = Math.min(parseInt(req.query.frames || FRAMES_PER_DEPLOYMENT, 10) || FRAMES_PER_DEPLOYMENT, 100);
   const deployments = await fetchRunningDeployments(orgId);
-  if (!deployments.length) seedMockData();
 
   const from = parseTime(req.query.date_from);
   const to = parseTime(req.query.date_to);
@@ -301,7 +328,6 @@ app.get('/api/analytics', async (req, res) => {
 
   const orgId = req.query.org_id || ORG_ID;
   const deployments = await fetchRunningDeployments(orgId);
-  if (!deployments.length) seedMockData();
 
   const allFrames = buildFrames(eventStore.filter(e => e.ts >= from && e.ts <= to));
   let frames = [];
