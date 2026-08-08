@@ -342,6 +342,7 @@ app.get('/api/analytics', async (req, res) => {
     total_duration_ms: 0
   };
   const componentStats = {};
+  for (const comp of COMPONENTS) componentStats[comp] = { total_ms: 0, count: 0, min_ms: Infinity, max_ms: 0, avg_ms: 0 };
   for (const f of frames) {
     summary.total_duration_ms += f.total_ms || 0;
     for (const [comp, ms] of Object.entries(f.component_breakdown)) {
