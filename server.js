@@ -89,6 +89,7 @@ function selectJwtSecret() {
 }
 
 let activeJwt = selectJwtSecret();
+if (!activeJwt) console.error('No usable JWT signing secret found. Set JWT_SECRET or JAVA_JWT_SECRET.');
 
 function getServiceToken() {
   if (!activeJwt) return null;
@@ -114,7 +115,10 @@ async function callBackdoor(pathname, params = {}, orgId) {
       params, headers: backdoorHeaders(orgId), timeout: 5000
     });
     return data;
-  } catch (_) { return null; }
+  } catch (err) {
+    console.error('Backdoor call failed:', pathname, err.response ? err.response.status : err.message);
+    return null;
+  }
 }
 
 // ── Deployments ────────────────────────────────────────────────
