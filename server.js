@@ -12,7 +12,17 @@ const BACKDOOR_BASE_URL = (process.env.BACKDOOR_BASE_URL || '').replace(/\/$/, '
 const BACKDOOR_TOKEN = process.env.BACKDOOR_TOKEN || null;
 const JWT_SECRET = process.env.JWT_SECRET || null;
 const JAVA_JWT_SECRET = process.env.JAVA_JWT_SECRET || null;
-const ORG_ID = process.env.ORG_ID || 'default';
+function extractOrgFromToken(token) {
+  if (!token) return null;
+  try {
+    const payload = jwt.decode(token);
+    return payload?.org_id || payload?.orgId || payload?.userOrgDetails?.orgId || null;
+  } catch {
+    return null;
+  }
+}
+
+const ORG_ID = process.env.ORG_ID || extractOrgFromToken(BACKDOOR_TOKEN) || 'default';
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const MAX_EVENTS = parseInt(process.env.MAX_EVENTS || '100000', 10);
 const FRAMES_PER_DEPLOYMENT = parseInt(process.env.FRAMES_PER_DEPLOYMENT || '10', 10);
@@ -89,7 +99,14 @@ function selectJwtSecret() {
 }
 
 let activeJwt = selectJwtSecret();
-if (!activeJwt) console.error('No usable JWT signing secret found. Set JWT_SECRET or JAVA_JWT_SECRET.');
+if (!activeJwt) {
+  if (BACKDOOR_TOKEN) {
+    console.log('No JWT signing secret; using BACKDOOR_TOKEN fallback for backdoor calls.');
+  } else {
+    console.error('No usable JWT signing secret found. Set JWT_SECRET or JAVA_JWT_SECRET, or BACKDOOR_TOKEN.');
+  }
+}
+console.log(`Telemetry ORG_ID=${ORG_ID}, backdoor=${BACKDOOR_BASE_URL || 'disabled'}, token source=${activeJwt ? 'generated' : (BACKDOOR_TOKEN ? 'BACKDOOR_TOKEN' : 'none')}`);
 
 function getServiceToken() {
   if (!activeJwt) return null;
@@ -111,7 +128,9 @@ function backdoorHeaders(orgId) {
 async function callBackdoor(pathname, params = {}, orgId) {
   if (!BACKDOOR_BASE_URL) return null;
   try {
-    const { data } = await axios.get(`${BACKDOOR_BASE_URL}${pathname}`, {
+    const target = `${BACKDOOR_BASE_URL}${pathname}`;
+    console.log('Backdoor call:', target, 'org:', orgId || ORG_ID);
+    const { data } = await axios.get(target, {
       params, headers: backdoorHeaders(orgId), timeout: 5000
     });
     return data;
