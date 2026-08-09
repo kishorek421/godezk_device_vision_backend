@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const jwt = require('jsonwebtoken');
 const { createClient } = require('redis');
 const fs = require('fs');
 const path = require('path');
@@ -9,6 +10,8 @@ const path = require('path');
 const PORT = process.env.PORT || 3010;
 const BACKDOOR_BASE_URL = (process.env.BACKDOOR_BASE_URL || '').replace(/\/$/, '');
 const BACKDOOR_TOKEN = process.env.BACKDOOR_TOKEN || null;
+const JWT_SECRET = process.env.JWT_SECRET || null;
+const JAVA_JWT_SECRET = process.env.JAVA_JWT_SECRET || null;
 const ORG_ID = process.env.ORG_ID || 'default';
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const MAX_EVENTS = parseInt(process.env.MAX_EVENTS || '100000', 10);
@@ -61,9 +64,46 @@ function parseTime(value) {
   return new Date(str).getTime() || null;
 }
 
+function selectJwtSecret() {
+  if (JAVA_JWT_SECRET) {
+    const raw = JAVA_JWT_SECRET;
+    const hex = (() => { try { return Buffer.from(JAVA_JWT_SECRET, 'hex').toString('binary'); } catch (_) { return null; } })();
+    for (const secret of [raw, hex].filter(Boolean)) {
+      for (const alg of ['HS512', 'HS256']) {
+        try {
+          const t = jwt.sign({ test: 1 }, secret, { algorithm: alg, expiresIn: 1 });
+          jwt.verify(t, secret, { algorithms: [alg] });
+          return { secret, algorithm: alg };
+        } catch (_) {}
+      }
+    }
+  }
+  if (JWT_SECRET) {
+    try {
+      const t = jwt.sign({ test: 1 }, JWT_SECRET, { algorithm: 'HS256', expiresIn: 1 });
+      jwt.verify(t, JWT_SECRET, { algorithms: ['HS256'] });
+      return { secret: JWT_SECRET, algorithm: 'HS256' };
+    } catch (_) {}
+  }
+  return null;
+}
+
+let activeJwt = selectJwtSecret();
+
+function getServiceToken() {
+  if (!activeJwt) return null;
+  return jwt.sign({
+    sub: 'telemetry-service',
+    username: 'Telemetry Service',
+    role: ['ADMIN'],
+    org_id: ORG_ID
+  }, activeJwt.secret, { algorithm: activeJwt.algorithm, expiresIn: '1h' });
+}
+
 function backdoorHeaders(orgId) {
   const headers = { 'x-org-id': orgId || ORG_ID };
-  if (BACKDOOR_TOKEN) headers.Authorization = `Bearer ${BACKDOOR_TOKEN}`;
+  const token = getServiceToken() || BACKDOOR_TOKEN;
+  if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
 }
 
